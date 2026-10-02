@@ -189,9 +189,88 @@ window is resized.
 
 ## Not yet read in depth (deferred, not blocking the plan above)
 
-`sdl_input.cpp` (pointer button plumbing — relevant to the Phase 1 VR
-left-click bug, logged separately), `sdl_touch.cpp`, `sdl_rail*.cpp` (RAIL
-mode — out of scope, multi-window is for full-desktop mode only), option
-parsing in `client/common/cmdline.c` (where `/vmonitors` itself will be
-added). These will get a focused read in Phase 3 when the corresponding
-code is actually touched, rather than up front.
+`sdl_rail*.cpp` (RAIL mode — out of scope, multi-window is for full-desktop
+mode only), option parsing in `client/common/cmdline.c` beyond what
+`/vmonitors`/`/vmonitor-scale` needed. `sdl_input.cpp`/`sdl_touch.cpp` have
+since been read in full — see below.
+
+## Phase 3 increment 1 build/live-test results (2026-10-02)
+
+`/vmonitors`/`/vmonitor-scale` implemented (`sdl_vmonitor.cpp/hpp`, wired
+into `preConnect`/`createWindows`/`postConnect` in `sdl_context.cpp`),
+plus damage-rect culling in `drawToWindows()`. Confirmed live on the
+Frame: 3 windows spawn correctly, each showing the right region, correct
+bounding-box desktop size. Two issues found during live testing, both
+investigated to a root cause — neither is a bug in this fork's code:
+
+### Input lag / backlog with 3 windows
+
+Severe (multi-second) input lag was observed in the first live 3-window
+test, with a 300+ event backlog dumping at once on window close. Traced
+with two tools: (1) per-event TRACE logging already in `sdl_run()`
+(`sdl_freerdp.cpp`) showed no single processing gap over ~1.2s anywhere,
+ruling out our own event loop stalling; (2) comparing against the
+Phase 0 spike (trivial render cost) under the exact same conditions
+showed the spike handled 3 windows smoothly while the real client did
+not, implicating render/update cost specifically, not window count
+alone. Added `event.common.timestamp`-based staleness logging (now
+permanent, see `sdl_freerdp.cpp`) to measure how long events actually sat
+queued inside SDL rather than how long our own loop took between
+iterations — this is the more precise signal; the simple "gap between
+log lines" measurement can look fine even while a real backlog is
+building invisibly in SDL's queue.
+
+A later repeat of the same 3-window test, after the binary had already
+been run several times (warm Vulkan shader/pipeline caches, confirmed by
+"Gamescope WSI" shader-compile chatter in the first capture but not
+later ones), showed near-real-time staleness (~0.5ms average) — matching
+Erick's own report that it felt much more responsive. Likely explanation:
+first-run-after-rebuild Vulkan shader compilation, not a structural
+multi-window limitation. Not fully isolated from ordinary session-to-
+session variance; worth re-checking if severe lag recurs, but not worth
+more synthetic chasing right now given the positive signal.
+
+One confirmed, real, and separate contributing factor either way: two
+open upstream gamescope issues describe exactly this class of problem —
+[#437](https://github.com/ValveSoftware/gamescope/issues/437) ("gets
+confused and rapidly switching between windows" when one process has
+several, open since 2022, updated as recently as July 2026) and
+[#1709](https://github.com/ValveSoftware/gamescope/issues/1709)
+(multi-window app freeze/stall specifically on window close, open). If
+severe lag does recur, it's gamescope's own multi-window handling, not
+something fixable from this fork's code.
+
+`SDL_EVENT_MOUSE_WHEEL`'s `event.common.timestamp` comes from a different
+clock than other event types on this platform/driver (produces nonsense
+multi-second "staleness" if compared naively against `SDL_GetTicks()`) —
+exclude wheel events from any future staleness analysis.
+
+### Left-click does nothing (confirmed root cause, not fixable here)
+
+Read `sdl_touch.cpp`'s `SdlTouch::handleEvent(SdlContext*, const
+SDL_MouseButtonEvent&)` (the actual SDL-button-to-RDP-PTR_FLAGS mapping)
+and `SdlContext::handleEvent(const SDL_MouseButtonEvent&)` (the window
+lookup/coordinate-conversion path that calls it) in full. Both are
+correct and symmetric — button 1 (left) and button 3 (right) go through
+identical code paths with no special-casing that would explain one
+working and the other not.
+
+Added temporary logging at every point either function could silently
+drop an event (window lookup miss, coordinate conversion failure) plus
+the raw SDL button number, and had Erick reproduce on real hardware.
+Result: **SDL button value 1 (left) never appears in the event stream at
+all**, in any capture, ever — only button 2 (middle) and button 3
+(right), both processed and forwarded successfully 100% of the time with
+zero drops. The bug is not in this fork's code, not in event delivery
+timing, and not in the button-to-PTR_FLAGS mapping — SDL is simply never
+handed a left-button event by the compositor in the first place.
+
+Likely explanation, matching documented SteamVR dashboard/overlay
+behavior: the controller trigger's primary function in the VR dashboard
+is grabbing and moving the panel itself (a compositor-level gesture),
+which would consume the press before any left-click event reaches the
+app. This is a VR input-model question outside this fork's reach, not a
+client bug — parking it as a known limitation rather than continuing to
+chase it in client code. If Erick finds a controller gesture or SteamVR
+binding that produces a real button-1 event, revisit; otherwise this
+isn't fixable from here.
