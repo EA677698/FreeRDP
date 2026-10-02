@@ -247,8 +247,26 @@ instead of once per batch (`sdl_freerdp.cpp`) — strictly more correct
 too, not just faster, since the surface drawn from always reflects the
 latest state regardless of how many batches arrived; the old code could
 burn a full render+present cycle on a stale intermediate frame that a
-newer already-queued batch immediately superseded anyway. Effect on the
-actual staleness numbers not yet re-measured with this fix in place.
+newer already-queued batch immediately superseded anyway.
+
+**Re-tested: the coalescing fix did not help.** Staleness still grew
+monotonically (~10.9s avg mid-session, ~20.6s avg / 24.2s peak late
+session, over a 112s run) — if anything slightly worse than before,
+within session-to-session noise. Root cause: `SDL_EVENT_USER_UPDATE`
+counts are nearly identical before/after the fix (1168 vs 1263 over
+similar-length sessions) — there wasn't a backlog of redundant queued
+draws to coalesce in the first place. Each update was already being
+handled close to one at a time; the bottleneck is the cost of each
+individual draw+present cycle itself under gamescope, not wasted
+duplicate work. Added direct timing instrumentation around
+`drawRects()` (texture upload) and `updateSurface()` (the actual
+`SDL_RenderPresent`) separately in `drawToWindow()` (`sdl_context.cpp`)
+to measure which half is actually expensive, rather than guessing.
+Next capture should show this directly. If present (not upload) turns
+out to be the expensive part, that points at the bigger, previously
+deferred architecture question (shared GPU texture / fewer
+simultaneous swapchains) rather than anything fixable by changing how
+often we draw.
 
 One confirmed, real, and separate contributing factor either way: two
 open upstream gamescope issues describe exactly this class of problem —
