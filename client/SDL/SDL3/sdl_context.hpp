@@ -73,6 +73,12 @@ class SdlContext
 	[[nodiscard]] bool toggleFullscreen();
 	[[nodiscard]] bool setFullscreen(bool enter, bool forceOriginalDisplay = false);
 
+	/* /vmonitors: fullscreen toggle scoped to a single window, since each
+	 * declared monitor is its own independent panel rather than part of one
+	 * tiled real-multimon desktop. Falls back to no-op if the window isn't
+	 * found (e.g. closed between keypress and handling). */
+	[[nodiscard]] bool toggleFullscreen(SDL_WindowID id);
+
 	[[nodiscard]] bool setMinimized();
 
 	[[nodiscard]] bool grabMouse() const;

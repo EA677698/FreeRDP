@@ -570,6 +570,10 @@ bool sdlInput::handleEvent(const SDL_KeyboardEvent& ev)
 				           masktostr(_hotkeyModmask).c_str(), sdl_scancode_name(_hotkeyFullscreen));
 				if (!keyboard_sync_state())
 					return false;
+				/* /vmonitors: each window is an independent panel, so only toggle the one
+				 * that had focus, not every declared monitor at once like real multimon. */
+				if (_sdl->vmonitorsActive())
+					return _sdl->toggleFullscreen(ev.windowID);
 				return _sdl->toggleFullscreen();
 			}
 			if (ev.scancode == _hotkeyResizable)

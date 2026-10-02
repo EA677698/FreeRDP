@@ -2098,3 +2098,12 @@ bool SdlContext::toggleFullscreen()
 {
 	return setFullscreen(!fullscreen());
 }
+
+bool SdlContext::toggleFullscreen(SDL_WindowID id)
+{
+	auto window = getWindowForId(id);
+	if (!window)
+		return true;
+	const bool isFullscreen = (SDL_GetWindowFlags(window->window()) & SDL_WINDOW_FULLSCREEN) != 0;
+	return sdl_push_user_event(SDL_EVENT_USER_WINDOW_FULLSCREEN, window, !isFullscreen, true);
+}
