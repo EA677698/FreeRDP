@@ -223,12 +223,32 @@ building invisibly in SDL's queue.
 A later repeat of the same 3-window test, after the binary had already
 been run several times (warm Vulkan shader/pipeline caches, confirmed by
 "Gamescope WSI" shader-compile chatter in the first capture but not
-later ones), showed near-real-time staleness (~0.5ms average) — matching
-Erick's own report that it felt much more responsive. Likely explanation:
-first-run-after-rebuild Vulkan shader compilation, not a structural
-multi-window limitation. Not fully isolated from ordinary session-to-
-session variance; worth re-checking if severe lag recurs, but not worth
-more synthetic chasing right now given the positive signal.
+later ones), showed near-real-time staleness (~0.5ms average). At the
+time this looked like a cold-shader-cache explanation. **That theory was
+wrong** — Erick re-ran the same prior binary twice more with no rebuild
+in between, and the severe lag was still there both times, ruling out
+"first run after rebuild" as the explanation. A subsequent capture with
+the same binary showed the real shape of the problem clearly: per-event
+staleness climbing from ~4s (first third of a 96s session) to ~11.6s
+average / 15.4s peak (last third) — a monotonically growing backlog for
+as long as the session ran, not noise.
+
+Root cause found by reading `sdl_freerdp.cpp`'s `SDL_EVENT_USER_UPDATE`
+handler: it was draining the rect queue one batch at a time, doing a
+full `drawToWindows()` (texture upload + present, per relevant window)
+for *every single queued batch separately* via a `do { pop(); draw(); }
+while (!empty)` loop. The server pushed ~1168 separate `endPaint()`
+notifications over that 96s session (~12/sec) — faster than several
+windows can be rendered and presented under gamescope, apparently, so
+one expensive draw cycle per queued batch instead of merging them falls
+further behind the longer the session runs. Fixed by merging every
+currently-queued batch's rects and drawing once per event-loop pass
+instead of once per batch (`sdl_freerdp.cpp`) — strictly more correct
+too, not just faster, since the surface drawn from always reflects the
+latest state regardless of how many batches arrived; the old code could
+burn a full render+present cycle on a stale intermediate frame that a
+newer already-queued batch immediately superseded anyway. Effect on the
+actual staleness numbers not yet re-measured with this fix in place.
 
 One confirmed, real, and separate contributing factor either way: two
 open upstream gamescope issues describe exactly this class of problem —
