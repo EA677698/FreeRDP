@@ -361,3 +361,48 @@ cursor lands in the corresponding place on the actual Windows desktop
 (e.g. drag a window to each clicked spot, or watch the OS cursor
 position). If clicks land offset by a consistent amount, this formula is
 the place to fix it.
+
+## Session paused here (2026-10-02) — jumped to Phase 5 packaging
+
+Erick's explicit call: stop Phase 3 here (input lag unresolved, not
+fixable client-side per above; left-click same), skip Phase 4 for now,
+jump to Phase 5 (packaging) early. Resume Phase 3 at "aspect-ratio
+letterbox resize" (spec functional requirement 3) if picked back up —
+everything before that in Phase 3's checklist is done. See the
+project-root `README.md` for the full current status summary; this file
+stays the detailed engineering log.
+
+### Phase 5: portable package
+
+Built a relocatable, standalone package at `~/sdl-freerdp-portable` on
+the Frame (sibling to `~/rdp-client`, not nested in it) — just
+`bin/sdl-freerdp` plus the 5 shared libraries it needs beyond what's
+already on the system (FreeRDP's own `libfreerdp3`/`libfreerdp-client3`/
+`libwinpr3`, plus `libSDL3`/`libSDL3_ttf` since those are this project's
+own local build, not a system package). ~12MB total.
+
+Used `cmake --install <build> --prefix <dir>` rather than hand-bundling
+libraries — FreeRDP's own build already sets `$ORIGIN`-relative RPATH on
+install (`cmake/ConfigureRPATH.cmake`'s `installWithRPATH()`, used
+throughout the tree), so an installed binary resolves its libraries
+relative to its own location automatically. The only two libraries
+`ldd` reported as `not found` after a plain install were `libSDL3.so.0`/
+`libSDL3_ttf.so.0` (copied in from `~/local/sdl3/lib`); everything else
+`cmake --install` or the binary needed was either already bundled
+correctly via RPATH or a legitimate system library already present.
+
+`cmake --install` pulls in far more than this package needs by default
+(xfreerdp/wlfreerdp/sfreerdp/winpr CLI tools, dev headers, cmake/
+pkgconfig files) — all deleted after confirming via `ldd ... | grep
+"not found"` that removing them didn't break anything `sdl-freerdp`
+itself needs. Exact prune list and full rebuild steps are in
+`packaging/README.md` (local copy) / the matching README shipped
+alongside the binary on the Frame.
+
+Verified non-visually end to end after trimming: launches, logs the
+correct bounding-box desktop size for the given `/vmonitors` layout,
+reaches the network layer. Added to Erick's Steam Library on the Frame
+as a non-Steam shortcut pointing at `run-vmonitors.sh`, with connection
+args (`/v:`, `/u:`, `/vmonitors:`) in Steam's own Launch Options field
+rather than hardcoded in the script — so the same package works for any
+host/layout without editing.
