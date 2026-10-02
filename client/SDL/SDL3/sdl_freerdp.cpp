@@ -247,13 +247,28 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 					break;
 					case SDL_EVENT_USER_UPDATE:
 					{
-						std::vector<SDL_Rect> rectangles;
-						do
+						/* Merge every currently-queued damage batch into one drawToWindows()
+						 * call instead of one full render+present cycle per batch. The server
+						 * can push endPaint() notifications faster than several windows can be
+						 * rendered and presented under gamescope; doing one expensive cycle per
+						 * queued batch instead of coalescing them falls behind a sustained
+						 * update rate and the backlog grows for as long as the session runs (seen
+						 * live: per-event staleness climbing from ~4s to ~15s over a 96s session).
+						 * The surface we draw from always reflects the latest state regardless of
+						 * how many batches arrived, so drawing once for the union of all pending
+						 * rects is strictly more correct, not just faster -- it never paints a
+						 * stale intermediate frame that a newer pending batch already supersedes.
+						 */
+						std::vector<SDL_Rect> merged;
+						while (true)
 						{
-							rectangles = sdl->pop();
-							if (!sdl->drawToWindows(rectangles))
-								throw ErrorMsg{ -1, windowEvent.type, "sdl->drawToWindows" };
-						} while (!rectangles.empty());
+							auto rectangles = sdl->pop();
+							if (rectangles.empty())
+								break;
+							merged.insert(merged.end(), rectangles.begin(), rectangles.end());
+						}
+						if (!sdl->drawToWindows(merged))
+							throw ErrorMsg{ -1, windowEvent.type, "sdl->drawToWindows" };
 					}
 					break;
 					case SDL_EVENT_USER_CREATE_WINDOWS:
