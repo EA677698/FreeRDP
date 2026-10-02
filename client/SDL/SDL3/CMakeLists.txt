@@ -37,6 +37,8 @@ set(SRCS
     sdl_disp.hpp
     sdl_monitor.cpp
     sdl_monitor.hpp
+    sdl_vmonitor.cpp
+    sdl_vmonitor.hpp
     sdl_freerdp.hpp
     sdl_freerdp.cpp
     sdl_channels.hpp
@@ -170,3 +172,7 @@ installwithrpath(TARGETS ${MODULE_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR} COMP
 install_freerdp_desktop("${MODULE_NAME}" "${SDL_CLIENT_UUID}")
 
 add_subdirectory(man)
+
+if(BUILD_TESTING_INTERNAL OR BUILD_TESTING)
+  add_subdirectory(test)
+endif()

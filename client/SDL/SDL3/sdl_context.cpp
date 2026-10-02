@@ -24,6 +24,7 @@
 #include "sdl_config.hpp"
 #include "sdl_channels.hpp"
 #include "sdl_monitor.hpp"
+#include "sdl_vmonitor.hpp"
 #include "sdl_pointer.hpp"
 #include "sdl_touch.hpp"
 
@@ -34,6 +35,8 @@
 #include <freerdp/client/aad_helper.h>
 
 static constexpr auto sdl_allow_screensaver = "sdl-allow-screensaver";
+static constexpr auto sdl_vmonitors = "vmonitors";
+static constexpr auto sdl_vmonitor_scale = "vmonitor-scale";
 
 SdlContext::SdlContext(rdpContext* context)
     : _context(context), _log(WLog_Get(CLIENT_TAG("SDL"))), _cursor(nullptr, sdl_Pointer_FreeCopy),
@@ -63,6 +66,17 @@ SdlContext::SdlContext(rdpContext* context)
 
 	_args.push_back({ sdl_allow_screensaver, COMMAND_LINE_VALUE_BOOL, nullptr, BoolValueFalse,
 	                  nullptr, -1, nullptr, "Allow local screensaver to activate" });
+
+	_args.push_back(
+	    { sdl_vmonitors, COMMAND_LINE_VALUE_REQUIRED, "<WxH[+X+Y][*]>[,...]", nullptr, nullptr, -1,
+	      nullptr,
+	      "Declare a virtual monitor layout independent of local displays, one window per "
+	      "declared monitor, e.g. /vmonitors:1920x1080,1920x1080+1920+0,1080x1920+3840+0*" });
+	_args.push_back({ sdl_vmonitor_scale, COMMAND_LINE_VALUE_REQUIRED, "<percent>[,...]", nullptr,
+	                  nullptr, -1, nullptr,
+	                  "Per-monitor desktop scale factor in percent for /vmonitors, either one "
+	                  "value for all monitors or one per declared monitor, e.g. "
+	                  "/vmonitor-scale:100,100,150" });
 
 	/* Push a null element used as abort when iterating the array */
 	_args.push_back({ nullptr, 0, nullptr, nullptr, nullptr, -1, nullptr, nullptr });
@@ -133,6 +147,62 @@ bool SdlContext::shallAbort(bool ignoreDialogs)
 	return false;
 }
 
+bool SdlContext::vmonitorsActive() const
+{
+	return !_vmonitorsArg.empty();
+}
+
+/* Builds FreeRDP_MonitorDefArray straight from the parsed /vmonitors spec,
+ * bypassing real local display detection entirely (sdl_detect_monitors()/
+ * addOrUpdateDisplay()) per the requirement that /vmonitors must not derive
+ * the layout from local displays. Window creation still needs a real
+ * SDL_DisplayID per monitor (for DPI lookup and initial placement only,
+ * never for the declared layout) -- every declared monitor is pointed at
+ * the current primary display, since Phase 0 confirmed initial on-screen
+ * placement does not matter: the compositor lets each window be moved
+ * independently afterward. */
+bool SdlContext::applyVirtualMonitors(UINT32* pMaxWidth, UINT32* pMaxHeight)
+{
+	WINPR_ASSERT(pMaxWidth);
+	WINPR_ASSERT(pMaxHeight);
+
+	std::vector<rdpMonitor> monitors;
+	std::string error;
+	if (!sdl::vmonitor::parse(_vmonitorsArg.c_str(),
+	                          _vmonitorScaleArg.empty() ? nullptr : _vmonitorScaleArg.c_str(),
+	                          monitors, error))
+	{
+		WLog_Print(getWLog(), WLOG_ERROR, "Invalid /vmonitors spec: %s", error.c_str());
+		return false;
+	}
+
+	if (!freerdp_settings_set_bool(context()->settings, FreeRDP_UseMultimon, TRUE))
+		return false;
+
+	if (!freerdp_settings_set_monitor_def_array_sorted(context()->settings, monitors.data(),
+	                                                   monitors.size()))
+		return false;
+
+	/* One real display backs every declared monitor's window; see comment above. */
+	const auto primary = SDL_GetPrimaryDisplay();
+	setMonitorIds(std::vector<SDL_DisplayID>(monitors.size(), primary));
+
+	int32_t left = 0;
+	int32_t top = 0;
+	int32_t right = 0;
+	int32_t bottom = 0;
+	for (const auto& m : monitors)
+	{
+		left = std::min(m.x, left);
+		top = std::min(m.y, top);
+		right = std::max(m.x + m.width, right);
+		bottom = std::max(m.y + m.height, bottom);
+	}
+	*pMaxWidth = WINPR_ASSERTING_INT_CAST(uint32_t, right - left);
+	*pMaxHeight = WINPR_ASSERTING_INT_CAST(uint32_t, bottom - top);
+	return true;
+}
+
 /* Called before a connection is established.
  * Set all configuration options to support and load channels here. */
 BOOL SdlContext::preConnect(freerdp* instance)
@@ -173,7 +243,12 @@ BOOL SdlContext::preConnect(freerdp* instance)
 		UINT32 maxWidth = 0;
 		UINT32 maxHeight = 0;
 
-		if (!sdl_detect_monitors(sdl, &maxWidth, &maxHeight))
+		if (sdl->vmonitorsActive())
+		{
+			if (!sdl->applyVirtualMonitors(&maxWidth, &maxHeight))
+				return FALSE;
+		}
+		else if (!sdl_detect_monitors(sdl, &maxWidth, &maxHeight))
 			return FALSE;
 
 		if ((maxWidth != 0) && (maxHeight != 0) &&
@@ -295,9 +370,13 @@ BOOL SdlContext::postConnect(freerdp* instance)
 
 	if (!sdl->setResizeable(false))
 		return FALSE;
-	if (!sdl->setFullscreen(freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) ||
-	                            freerdp_settings_get_bool(context->settings, FreeRDP_UseMultimon),
-	                        true))
+	/* Real multimon goes fullscreen to tile physical displays; /vmonitors
+	 * windows are meant to stay normal, movable windows instead. */
+	const bool wantsFullscreen =
+	    freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) ||
+	    (freerdp_settings_get_bool(context->settings, FreeRDP_UseMultimon) &&
+	     !sdl->vmonitorsActive());
+	if (!sdl->setFullscreen(wantsFullscreen, true))
 		return FALSE;
 	sdl->setConnected(true);
 	return TRUE;
@@ -414,7 +493,11 @@ bool SdlContext::createWindows()
 			flags |= SDL_WINDOW_FULLSCREEN;
 		}
 
-		if (freerdp_settings_get_bool(settings, FreeRDP_UseMultimon))
+		/* Real multimon tiles fullscreen panels across physical displays, so it
+		 * forces borderless. /vmonitors windows are meant to stay normal,
+		 * movable, titled windows instead (spec requirement: non-fullscreen by
+		 * default, decorated). */
+		if (freerdp_settings_get_bool(settings, FreeRDP_UseMultimon) && !vmonitorsActive())
 		{
 			flags |= SDL_WINDOW_BORDERLESS;
 		}
@@ -423,7 +506,14 @@ bool SdlContext::createWindows()
 			flags |= SDL_WINDOW_BORDERLESS;
 
 		auto did = WINPR_ASSERTING_INT_CAST(SDL_DisplayID, id);
-		auto window = SdlWindow::create(did, title, flags, w, h);
+		/* Spec requirement: "Monitor N - <host>", not the shared "FreeRDP: host"
+		 * title every window would otherwise get. */
+		auto windowTitleForMonitor =
+		    vmonitorsActive()
+		        ? ("Monitor " + std::to_string(x + 1) + " - " +
+		           freerdp_settings_get_server_name(settings))
+		        : title;
+		auto window = SdlWindow::create(did, windowTitleForMonitor, flags, w, h);
 
 		if (freerdp_settings_get_bool(settings, FreeRDP_UseMultimon))
 		{
@@ -1583,6 +1673,16 @@ int SdlContext::argumentHandler(const COMMAND_LINE_ARGUMENT_A* arg, void* custom
 					return -2;
 				}
 			}
+		}
+		else if (strcmp(arg->Name, sdl_vmonitors) == 0)
+		{
+			if (arg->Value)
+				sdl->_vmonitorsArg = arg->Value;
+		}
+		else if (strcmp(arg->Name, sdl_vmonitor_scale) == 0)
+		{
+			if (arg->Value)
+				sdl->_vmonitorScaleArg = arg->Value;
 		}
 	}
 	return 0;

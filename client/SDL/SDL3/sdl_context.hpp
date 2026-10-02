@@ -127,6 +127,11 @@ class SdlContext
 	[[nodiscard]] rdpMonitor getDisplay(SDL_DisplayID id) const;
 	[[nodiscard]] std::vector<SDL_DisplayID> getDisplayIds() const;
 
+	/* /vmonitors: user-declared virtual monitor layout, independent of the
+	 * local display(s). See sdl_vmonitor.hpp for the parser. */
+	[[nodiscard]] bool vmonitorsActive() const;
+	[[nodiscard]] bool applyVirtualMonitors(UINT32* pMaxWidth, UINT32* pMaxHeight);
+
 	[[nodiscard]] sdlDispContext& getDisplayChannelContext();
 	[[nodiscard]] sdlInput& getInputChannelContext();
 	[[nodiscard]] sdlClip& getClipboardChannelContext();
@@ -251,4 +256,6 @@ class SdlContext
 	std::vector<COMMAND_LINE_ARGUMENT_A> _args;
 	std::vector<rdpPointer*> _valid_pointers;
 	bool _credentialsRead = false;
+	std::string _vmonitorsArg;
+	std::string _vmonitorScaleArg;
 };
