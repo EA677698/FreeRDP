@@ -274,3 +274,36 @@ client bug — parking it as a known limitation rather than continuing to
 chase it in client code. If Erick finds a controller gesture or SteamVR
 binding that produces a real button-1 event, revisit; otherwise this
 isn't fixable from here.
+
+## Flagged, unresolved: input coordinate mapping for negative-origin layouts
+
+`createWindows()` computes each window's `offsetX/Y` as `originX -
+monitor->x` (`originX` = min x across all declared monitors, 0 if none
+negative). `applyMonitorOffset()` (called from the mouse/touch event
+handlers) then computes `remote_coord = local_pixel - offsetX`. For the
+common case (all monitors at x >= 0, `originX == 0`), this reduces to
+`remote_coord = local_pixel + monitor->x`, which is correct by hand
+calculation and matches every layout actually tested live so far
+(including `/vmonitors` runs — none used a negative position).
+
+Hand-deriving the case where some monitor has a negative declared x
+(`originX < 0`, e.g. a monitor placed left of or above the primary) gives
+what looks like wrong remote coordinates for *every* window, not just the
+negative one. Did not chase this further into the real-multimon-only
+`updateDisplayOffsetsForNeighbours`/`_offsets` neighbor-alignment path
+(separate machinery that also writes `monitor->x/y` before `createWindows`
+runs, only for real multimon, not `/vmonitors`) to see whether it changes
+the picture — that's a deeper read than was worth doing speculatively.
+
+This is **pre-existing, shared code, not something `/vmonitors` changes**
+— so not a regression, but it directly matters here since negative
+positions are an explicitly intended `/vmonitors` use case (spec section
+6.1's own examples, and the required test list includes "negative
+positions"). Needs an empirical check, not more paper derivation:
+
+**Test to run:** `/vmonitors:1920x1080,1920x1080-1920+0`, then click near
+the left edge and right edge of *each* window and confirm the remote
+cursor lands in the corresponding place on the actual Windows desktop
+(e.g. drag a window to each clicked spot, or watch the OS cursor
+position). If clicks land offset by a consistent amount, this formula is
+the place to fix it.
