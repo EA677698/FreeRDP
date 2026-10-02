@@ -262,11 +262,27 @@ duplicate work. Added direct timing instrumentation around
 `drawRects()` (texture upload) and `updateSurface()` (the actual
 `SDL_RenderPresent`) separately in `drawToWindow()` (`sdl_context.cpp`)
 to measure which half is actually expensive, rather than guessing.
-Next capture should show this directly. If present (not upload) turns
-out to be the expensive part, that points at the bigger, previously
-deferred architecture question (shared GPU texture / fewer
-simultaneous swapchains) rather than anything fixable by changing how
-often we draw.
+**Result: rendering is not the bottleneck either.** Captured 423 draws
+across a full session: total upload+present time summed to 1.6 seconds
+(avg 3.8ms/draw, p99 30ms, worst single draw 51ms). Nowhere close to
+explaining 20+ seconds of staleness. This rules out everything within
+this client's control that was plausible: the event loop isn't
+stalling (checked earlier via inter-event gaps), and now render/present
+cost isn't either (checked directly via per-call timing).
+
+**Conclusion: the delay is upstream of this process, in gamescope's own
+event delivery, not fixable from this fork.** Each event's "staleness"
+is measured against a timestamp SDL assigns when it receives the event
+from the compositor, not when this code gets around to handling it --
+if that timestamp is already old on arrival, the delay happened before
+any of this client's code ever saw the event. Matches the two open
+upstream gamescope issues above (#437, #1709) exactly: multi-window-
+per-process handling genuinely degraded in gamescope itself, worsening
+over a sustained session. Not pursuing further client-side
+instrumentation for this -- the remaining options are living with it,
+raising it upstream with gamescope, or a much larger architectural
+pivot (e.g. separate OS processes per window, untested, unproven
+against this specific cause) if it blocks real use.
 
 One confirmed, real, and separate contributing factor either way: two
 open upstream gamescope issues describe exactly this class of problem —
