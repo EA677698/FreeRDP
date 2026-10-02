@@ -181,8 +181,21 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 						continue;
 				}
 
-				WLog_Print(sdl->getWLog(), WLOG_TRACE, "got event %s [0x%08" PRIx32 "]",
-				           sdl::utils::toString(windowEvent.type).c_str(), windowEvent.type);
+				/* windowEvent.common.timestamp is nanoseconds from SDL_GetTicksNS(), the
+				 * clock SDL stamps events with at generation time. Comparing it to "now"
+				 * shows how long this event sat queued inside SDL before we dequeued it --
+				 * not the same thing as the gap between consecutive log lines, which only
+				 * shows how long we took to loop back around, not how deep a backlog grew
+				 * inside SDL's queue while we were busy. */
+				{
+					const Sint64 nowMs = static_cast<Sint64>(SDL_GetTicks());
+					const Sint64 eventMs =
+					    static_cast<Sint64>(windowEvent.common.timestamp / 1000000ULL);
+					WLog_Print(sdl->getWLog(), WLOG_TRACE,
+					           "got event %s [0x%08" PRIx32 "] staleness=%" PRId64 "ms",
+					           sdl::utils::toString(windowEvent.type).c_str(), windowEvent.type,
+					           nowMs - eventMs);
+				}
 				if (sdl->shallAbort(true))
 					continue;
 
