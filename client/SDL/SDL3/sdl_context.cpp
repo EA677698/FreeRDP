@@ -1780,9 +1780,44 @@ bool SdlContext::drawToWindows(const std::vector<SDL_Rect>& rects)
 			drawRects = { { 0, 0, _primary->w, _primary->h } };
 	}
 
+	/* Per-window multimon offset puts each window's monitor region at a known
+	 * rect within the shared surface's coordinate space; a damage rect that
+	 * doesn't land inside a window's own rect there can't change anything
+	 * visible in that window. Skipping those windows avoids an unnecessary
+	 * texture upload and present per irrelevant damage rect -- with several
+	 * windows, present calls are the expensive, potentially-blocking part
+	 * (each is its own round trip to the compositor), so this matters more
+	 * than the upload itself. */
+	const bool canCullByWindow =
+	    !useLocalScale() && freerdp_settings_get_bool(context()->settings, FreeRDP_UseMultimon);
+
 	for (auto& window : _windows)
 	{
-		if (!drawToWindow(window.second, drawRects))
+		if (!canCullByWindow)
+		{
+			if (!drawToWindow(window.second, drawRects))
+				return false;
+			continue;
+		}
+
+		const SDL_Point offset{ window.second.offsetX(), window.second.offsetY() };
+		const auto wrect = window.second.rect();
+		const SDL_Rect windowBounds{ 0, 0, wrect.w, wrect.h };
+
+		std::vector<SDL_Rect> relevant;
+		relevant.reserve(drawRects.size());
+		for (const auto& r : drawRects)
+		{
+			const SDL_Rect shifted{ r.x + offset.x, r.y + offset.y, r.w, r.h };
+			SDL_Rect intersection{};
+			if (SDL_GetRectIntersection(&shifted, &windowBounds, &intersection))
+				relevant.push_back(r);
+		}
+
+		if (relevant.empty())
+			continue;
+
+		if (!drawToWindow(window.second, relevant))
 			return false;
 	}
 
