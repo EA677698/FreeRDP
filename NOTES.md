@@ -406,3 +406,27 @@ as a non-Steam shortcut pointing at `run-vmonitors.sh`, with connection
 args (`/v:`, `/u:`, `/vmonitors:`) in Steam's own Launch Options field
 rather than hardcoded in the script — so the same package works for any
 host/layout without editing.
+
+## "Can I go back to the build that had low lag?" (2026-10-06)
+
+No meaningfully different build to go back to — this was asked in a
+follow-up session, Frame unavailable to test, answered from the existing
+evidence above. The commit-by-commit timeline:
+
+- `94a8087` (adds `/vmonitors` + damage-rect culling): built, tested →
+  **severe lag** (the very first capture, 300+ event dump on close).
+- `7add08d` (adds *only* the staleness logging, no functional change):
+  same rendering/input code as above, tested right alongside the spike
+  → **the one good run** (~0.5ms avg staleness).
+- `46178a7` (adds per-window fullscreen toggle, dead code unless that
+  hotkey is pressed, which it wasn't during these tests): **severe lag
+  again** — and Erick independently re-ran that same binary twice more
+  with no rebuild, still bad both times.
+
+The functional code was identical across the bad → good → bad sequence.
+Tagged `7add08d` locally as `lowest-lag-observed` for reference, but
+recommended retrying current HEAD first rather than reverting — since
+the exact same code already produced both outcomes, a revert isn't
+expected to reliably help, and current HEAD also has the damage-culling
+and coalescing fixes (real improvements, even though neither fixed the
+main lag) that a revert would throw away for no proven benefit.
