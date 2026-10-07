@@ -205,6 +205,10 @@ investigated to a root cause — neither is a bug in this fork's code:
 
 ### Input lag / backlog with 3 windows
 
+> **Superseded 2026-10-06:** the conclusion below ("upstream of this
+> process, in gamescope") was wrong. The lag was client-side and is fixed.
+> See "Input lag: real root cause and fix" at the end of this file.
+
 Severe (multi-second) input lag was observed in the first live 3-window
 test, with a 300+ event backlog dumping at once on window close. Traced
 with two tools: (1) per-event TRACE logging already in `sdl_run()`
@@ -300,6 +304,10 @@ multi-second "staleness" if compared naively against `SDL_GetTicks()`) —
 exclude wheel events from any future staleness analysis.
 
 ### Left-click does nothing (confirmed root cause, not fixable here)
+
+> **Superseded 2026-10-06:** the conclusion below was wrong. The trigger
+> arrives as touch, not a mouse button, and two client bugs dropped it. Fixed;
+> see "Left-click: real root cause and fix" at the end of this file.
 
 Read `sdl_touch.cpp`'s `SdlTouch::handleEvent(SdlContext*, const
 SDL_MouseButtonEvent&)` (the actual SDL-button-to-RDP-PTR_FLAGS mapping)
@@ -430,3 +438,142 @@ the exact same code already produced both outcomes, a revert isn't
 expected to reliably help, and current HEAD also has the damage-culling
 and coalescing fixes (real improvements, even though neither fixed the
 main lag) that a revert would throw away for no proven benefit.
+
+## Input lag: real root cause and fix (2026-10-06)
+
+The earlier conclusion ("delay is upstream, in gamescope") rested on one
+wrong assumption: that `event.common.timestamp` is when the compositor
+generated the event. On X11 it isn't. SDL3's `X11_GetEventTimestamp()`
+(`deps/sdl3-src/src/video/x11/SDL_x11events.c`) is a FIXME stub that
+returns `SDL_GetTicksNS()`, i.e. when SDL read the event off the X
+socket. So "staleness" measured only time spent queued *inside this
+process*, and a growing staleness meant our main loop was dequeuing
+slower than events arrived.
+
+**Evidence that was already in the old logs.** Re-analyzing
+`logs/timing_debug.log` by time-to-next-dequeue per event type (127s
+session): MOUSE_MOTION 6491 events / 40.6s, WINDOW_MOUSE_LEAVE 3005 /
+38.3s, WINDOW_MOUSE_ENTER 3006 / 32.6s, but USER_UPDATE (all rendering)
+1007 / 1.6s. The main thread spent ~111 of 127s on pointer events.
+`vmonitors_trace.log` shows the same pattern. The one "good" run
+(`freerdp_staleness.log`) had ~30 enter/leave pairs instead of ~3000.
+
+**Causes (both on the main thread, per event):**
+
+1. `sdlDispContext::handleEvent(const SDL_WindowEvent&)` calls
+   `window->setBordered()` on *every* window event. `SdlWindow::setBordered`
+   then called `SDL_SyncWindow()` unconditionally. On X11 that is
+   `X11_SyncWindowTimeout`: at least 2-3 `XSync` round trips plus an event
+   pump, ~10.5ms per call under gamescope's Xwayland. Every enter/leave
+   paid it.
+2. `sdlInput::mouse_focus()` raised the window (`SDL_RaiseWindow` +
+   `SDL_SyncWindow`) every time motion came from a different window than
+   the last one. Under gamescope this keeps the pointer flapping between
+   panels: measured ~34 enter/leave pairs/s **with no input at all**,
+   which on its own saturated the loop.
+
+**Fix:** `setBordered` returns early when the border state already
+matches (no sync), and `mouse_focus` doesn't raise under `/vmonitors`,
+where each window is an independent VR panel. Also removed the per-draw
+`[timing-debug]` INFO log from `drawToWindow`. It had answered its question
+and wrote a log line per draw.
+
+**Measurement.** New `[loop-stats]` diagnostic in `sdl_run`
+(`sdl_freerdp.cpp`): set `SDL_FREERDP_LOOP_STATS=1` and every 5s it logs
+handler time per event type, total busy vs. wait/pump time, and max
+staleness. The load generator, `tools/xdrive-pointer.py` in the framescape repo, is an XTest script on `DISPLAY=:0` that
+restacks the three client windows under the pointer and injects motion
+(~25 crossings/s and ~50 motions/s, like the old captures), 60s,
+`/vmonitors:1920x1080,1920x1080,1920x1080` against the test desktop:
+
+| | before | after |
+|---|---|---|
+| main thread busy | 98-100% | ~7% |
+| max staleness | 0.5s, climbing to 29s | 6-21ms, flat |
+| motion handler | 6-13ms | 0.08ms |
+| enter / leave | ~11ms / ~11ms | 0.4ms / 1.6ms |
+
+Logs: `logs/fix_baseline.log`, `logs/fix_after.log`. Confirmed by
+Erick on the controllers: "a lot better... usable". Gamescope #437/#1709
+may still be real, but they weren't what this was.
+
+## Left-click: real root cause and fix (2026-10-06)
+
+The VR trigger never produces a mouse button event. Gamescope runs with
+`--default-touch-mode 4` (passthrough; check `ps` for the gamescope
+command line), so a trigger pull reaches SDL as `SDL_EVENT_FINGER_DOWN`
+/ `FINGER_UP`. The old investigation only logged mouse buttons. The
+touches were already in `logs/freerdp_staleness.log` (31 FINGER_DOWN/UP
+pairs). Right-click and scroll come in as real mouse events, so they
+always worked.
+
+This session has no RDPEI (touch) channel, so `client/common/client.c`
+turns touches into emulated mouse clicks in
+`freerdp_handle_touch_to_mouse()`. That function had two bugs, and
+upstream master (checked 2026-10-06) has both:
+
+1. It picks the button from `contact->count` (1 finger = left, 2 = right,
+   ...), but nothing in the codebase ever wrote `count`. It was always 0,
+   so the switch fell through to "unmapped events, ignore" and every
+   touch was dropped. Fix: `freerdp_client_touch_update()` now sets
+   `count` to the number of active contacts.
+2. It sent `PTR_FLAGS_MOVE | PTR_FLAGS_DOWN | PTR_FLAGS_BUTTON1` as one
+   event. Windows treats an event with `PTR_FLAGS_MOVE` as a move and
+   ignores the button bits; a real mouse click never sets the move flag.
+   Fix: send the move as its own event, then the button event.
+
+Confirmed working by Erick on the controller. Worth sending upstream.
+
+## Remaining latency after the fixes (2026-10-06)
+
+Erick's estimate after the main-loop fix: ~300ms, "usable". Measured
+with the `[latency]` lines from `SDL_FREERDP_LOOP_STATS=1`: time from a
+key press reaching the client until the next large (>=200x200) screen
+update has been presented. Driven by `tools/xtype-latency.py ... start`,
+which opens and closes the Start menu. Median 66ms with 1 monitor, 75ms
+with 3 (p90 74 / 90ms). The client's own share (queue + draw + present)
+is 2-10ms. The rest is network, Windows, and decode. Windows mixes
+ClearCodec, progressive and some AVC420. Whatever remains is in the
+VR -> gamescope -> Xwayland input path or the gamescope -> headset
+display path, which this process can't see. After the click and lag
+fixes, Erick called the lag "almost imperceptible".
+
+## Dragging a window across panels: unresolved (2026-10-06)
+
+Symptom: dragging a window by its title bar from one panel to another,
+it stops at the first panel's edge.
+
+What the logs show: while the trigger is held, SteamVR keeps the pointer
+on the grabbed panel's plane (Erick noticed the cursor stays flat against
+that panel). Gamescope then pins the touch to that panel's edge (`raw x =
+1.000`). No events of any kind come from the other panel until release.
+Within ~15ms after release, gamescope reports LEAVE/ENTER and motion on
+the panel the pointer is really over. The first position or two on the
+new panel are often bogus: on its border (x=3839, panel 2's far edge, at
+the pinned height), or a stray position on the old panel (x=1130).
+
+Tried, on branch `drag-across-panels-wip` (commit e46ef4395): hold a
+touch release that happens while pinned to an edge; forward nothing
+during the hold; release at the first position strictly inside another
+panel (300ms timeout: release at the edge). In the last test all five
+releases went to the right remote positions (e.g. move to (3196,602),
+then button up), checked with `[rdp-mouse]` logging. **The window still
+didn't move there.** A remote-desktop snapshot taken 1s after the drop
+shows the dragged window snapped to the right half of panel 1, with Snap
+Assist open. Windows had snapped it at the edge during the hold.
+
+Replays with the branch's `SDL_FREERDP_DEBUG_SCRIPT` hook (raw RDP mouse
+input plus remote-desktop snapshots) did not reproduce the failure. A
+drag to the edge, lingering there (even flickering 3839/3840), then
+jumping and releasing moved the window correctly every time, including a
+replay of Erick's own recorded 22s drag.
+
+Leads for next time:
+- Windows edge Snap: the pointer is parked at x=1919, a shared monitor
+  edge, for seconds. Test by turning off Snap on the remote, or by keeping
+  the forwarded position a few pixels inside the panel while pinned.
+- Erick's guess: the target panel may need focus (a click) in gamescope
+  first.
+- The replays never reproduced the snap. Find out what differs in the
+  real sequence: timing, the touch emulation's pressed-button state, or
+  the hover motions after release.
