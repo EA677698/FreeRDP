@@ -2081,11 +2081,20 @@ static BOOL freerdp_handle_touch_to_mouse(rdpClientContext* cctx, BOOL down,
 	if (!cctx || !requireRdpClientContext(&cctx->context))
 		return FALSE;
 
-	const UINT16 flags = PTR_FLAGS_MOVE | (down ? PTR_FLAGS_DOWN : 0);
+	/* Move first, then the button event on its own, like a real mouse. Windows treats an
+	 * event carrying PTR_FLAGS_MOVE as a move and ignores the button flags in it, so a
+	 * combined MOVE|DOWN|BUTTON1 never clicked. */
+	const UINT16 flags = down ? PTR_FLAGS_DOWN : 0;
 	const UINT16 xflags = down ? PTR_XFLAGS_DOWN : 0;
 	WINPR_ASSERT(contact);
 	WINPR_ASSERT(contact->x <= UINT16_MAX);
 	WINPR_ASSERT(contact->y <= UINT16_MAX);
+
+	if ((contact->count >= 1) && (contact->count <= 5))
+	{
+		if (!freerdp_client_send_button_event(cctx, FALSE, PTR_FLAGS_MOVE, contact->x, contact->y))
+			return FALSE;
+	}
 
 	switch (contact->count)
 	{
@@ -2343,6 +2352,17 @@ static BOOL freerdp_client_touch_update(rdpClientContext* cctx, UINT32 flags, IN
 			contact->pressure = pressure;
 			contact->x = x;
 			contact->y = y;
+
+			/* Number of fingers currently down, including this one. The touch-to-mouse
+			 * fallback (no RDPEI channel) picks the button from it; left unset it was
+			 * always 0 and every emulated click was dropped. An active slot has flags set
+			 * (a released one is zeroed below), which also covers touch id 0. */
+			contact->count = 0;
+			for (size_t j = 0; j < ARRAYSIZE(cctx->contacts); j++)
+			{
+				if (cctx->contacts[j].flags != 0)
+					contact->count++;
+			}
 
 			*pcontact = *contact;
 
