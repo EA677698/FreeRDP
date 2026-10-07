@@ -1031,22 +1031,8 @@ bool SdlContext::drawToWindow(SdlWindow& window, const std::vector<SDL_Rect>& re
 		SDL_Point offset{ 0, 0 };
 		if (freerdp_settings_get_bool(context()->settings, FreeRDP_UseMultimon))
 			offset = { window.offsetX(), window.offsetY() };
-		/* Timing for the coalescing-fix follow-up: direct per-call cost of upload vs.
-		 * present, to tell whether the bottleneck is actually redundant draws (ruled
-		 * out by the coalescing fix not helping) or the cost of each individual
-		 * draw+present under gamescope. */
-		const Uint64 t0 = SDL_GetTicks();
-		const bool drawOk = window.drawRects(surface, offset, rects);
-		const Uint64 t1 = SDL_GetTicks();
-		if (!drawOk)
+		if (!window.drawRects(surface, offset, rects))
 			return false;
-		window.updateSurface();
-		const Uint64 t2 = SDL_GetTicks();
-		WLog_Print(getWLog(), WLOG_INFO,
-		           "[timing-debug] window=%u rects=%" PRIuz " upload=%" PRIu64
-		           "ms present=%" PRIu64 "ms",
-		           window.id(), rects.size(), t1 - t0, t2 - t1);
-		return true;
 	}
 
 	window.updateSurface();

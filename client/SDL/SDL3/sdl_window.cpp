@@ -204,8 +204,17 @@ bool SdlWindow::grabMouse(bool enable)
 
 void SdlWindow::setBordered(bool bordered)
 {
-	if (_window)
-		SDL_SetWindowBordered(_window, bordered);
+	if (!_window)
+		return;
+
+	/* Called for every window event (sdlDispContext::handleEvent), including each
+	 * pointer enter/leave. SDL_SetWindowBordered is a no-op when nothing changes,
+	 * but SDL_SyncWindow is not: on X11 it is several XSync round trips plus an
+	 * event pump, ~10ms each under gamescope. Only sync on a real change. */
+	const bool isBordered = (SDL_GetWindowFlags(_window) & SDL_WINDOW_BORDERLESS) == 0;
+	if (isBordered == bordered)
+		return;
+	SDL_SetWindowBordered(_window, bordered);
 	std::ignore = SDL_SyncWindow(_window);
 }
 
