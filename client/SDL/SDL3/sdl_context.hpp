@@ -136,6 +136,10 @@ class SdlContext
 	/* /vmonitors: user-declared virtual monitor layout, independent of the
 	 * local display(s). See sdl_vmonitor.hpp for the parser. */
 	[[nodiscard]] bool vmonitorsActive() const;
+	/* [debug-script] temporary */
+	bool debugSaveSnapshot(const char* path);
+	/* generation < 0 flushes unconditionally; otherwise only that deferral's timer */
+	[[nodiscard]] bool flushPendingTouchRelease(int generation = -1);
 	[[nodiscard]] bool applyVirtualMonitors(UINT32* pMaxWidth, UINT32* pMaxHeight);
 
 	[[nodiscard]] sdlDispContext& getDisplayChannelContext();
@@ -197,6 +201,10 @@ class SdlContext
 	[[nodiscard]] bool handleEvent(const SDL_MouseMotionEvent& ev);
 	[[nodiscard]] bool handleEvent(const SDL_MouseWheelEvent& ev);
 	[[nodiscard]] bool handleEvent(const SDL_TouchFingerEvent& ev);
+	[[nodiscard]] bool deferTouchRelease(const SDL_TouchFingerEvent& raw,
+	                                     const SDL_TouchFingerEvent& remote);
+	[[nodiscard]] bool resolvePendingTouchRelease(SDL_WindowID windowID, const SDL_FPoint& local,
+	                                              float x, float y);
 
 	void addOrUpdateDisplay(SDL_DisplayID id);
 	void deleteDisplay(SDL_DisplayID id);
@@ -264,4 +272,14 @@ class SdlContext
 	bool _credentialsRead = false;
 	std::string _vmonitorsArg;
 	std::string _vmonitorScaleArg;
+	/* deferred touch release for drags across /vmonitors panels, see deferTouchRelease */
+	SDL_TouchFingerEvent _pendingTouchRelease{};
+	bool _pendingTouchReleaseActive = false;
+	int _pendingTouchReleaseGeneration = 0;
+
+  public:
+	/* [debug-script] temporary */
+	Uint64 _dbgLogMotionUntil = 0;
+	Uint64 _dbgSnapAt = 0;
+	int _dbgSnapCount = 0;
 };

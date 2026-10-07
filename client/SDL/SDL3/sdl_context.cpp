@@ -1031,22 +1031,8 @@ bool SdlContext::drawToWindow(SdlWindow& window, const std::vector<SDL_Rect>& re
 		SDL_Point offset{ 0, 0 };
 		if (freerdp_settings_get_bool(context()->settings, FreeRDP_UseMultimon))
 			offset = { window.offsetX(), window.offsetY() };
-		/* Timing for the coalescing-fix follow-up: direct per-call cost of upload vs.
-		 * present, to tell whether the bottleneck is actually redundant draws (ruled
-		 * out by the coalescing fix not helping) or the cost of each individual
-		 * draw+present under gamescope. */
-		const Uint64 t0 = SDL_GetTicks();
-		const bool drawOk = window.drawRects(surface, offset, rects);
-		const Uint64 t1 = SDL_GetTicks();
-		if (!drawOk)
+		if (!window.drawRects(surface, offset, rects))
 			return false;
-		window.updateSurface();
-		const Uint64 t2 = SDL_GetTicks();
-		WLog_Print(getWLog(), WLOG_INFO,
-		           "[timing-debug] window=%u rects=%" PRIuz " upload=%" PRIu64
-		           "ms present=%" PRIu64 "ms",
-		           window.id(), rects.size(), t1 - t0, t2 - t1);
-		return true;
 	}
 
 	window.updateSurface();
@@ -1209,7 +1195,16 @@ bool SdlContext::handleEvent(const SDL_MouseMotionEvent& ev)
 		return true;
 	removeLocalScaling(copy.motion.x, copy.motion.y);
 	removeLocalScaling(copy.motion.xrel, copy.motion.yrel);
+	const SDL_FPoint local{ copy.motion.x, copy.motion.y };
 	applyMonitorOffset(copy.motion.windowID, copy.motion.x, copy.motion.y);
+	/* [debug-script] temporary: positions right after a deferred release */
+	if (_dbgLogMotionUntil > SDL_GetTicks())
+		WLog_Print(getWLog(), WLOG_INFO, "[drag-debug] motion window=%u remote=%.0f,%.0f",
+		           copy.motion.windowID, static_cast<double>(copy.motion.x),
+		           static_cast<double>(copy.motion.y));
+	if (_pendingTouchReleaseActive)
+		return resolvePendingTouchRelease(copy.motion.windowID, local, copy.motion.x,
+		                                  copy.motion.y);
 
 	return SdlTouch::handleEvent(this, copy.motion);
 }
@@ -1434,6 +1429,14 @@ bool SdlContext::handleEvent(const SDL_TouchFingerEvent& ev)
 {
 	if (!getWindowForId(ev.windowID))
 		return true;
+
+	/* A new touch ends any deferred release first, so button state stays paired. */
+	if (ev.type == SDL_EVENT_FINGER_DOWN)
+	{
+		if (!flushPendingTouchRelease())
+			return false;
+	}
+
 	SDL_Event copy{};
 	copy.tfinger = ev;
 	if (!eventToPixelCoordinates(ev.windowID, copy))
@@ -1441,7 +1444,98 @@ bool SdlContext::handleEvent(const SDL_TouchFingerEvent& ev)
 	removeLocalScaling(copy.tfinger.dx, copy.tfinger.dy);
 	removeLocalScaling(copy.tfinger.x, copy.tfinger.y);
 	applyMonitorOffset(copy.tfinger.windowID, copy.tfinger.x, copy.tfinger.y);
+
+	if ((ev.type == SDL_EVENT_FINGER_UP) && deferTouchRelease(ev, copy.tfinger))
+		return true;
 	return SdlTouch::handleEvent(this, copy.tfinger);
+}
+
+/* Under /vmonitors with gamescope, a held VR trigger is a touch that stays on the panel it
+ * started on: once the pointer crosses onto another panel, the touch is pinned to the first
+ * panel's edge and no events come from the other panel until release. Right after release,
+ * gamescope reports pointer motion on the panel the pointer is actually over. So a touch
+ * released while pinned to an edge is held back briefly: if the next motion comes from
+ * another window, the release happens there (a window dragged across panels drops where it
+ * was let go), otherwise (after a short timeout) at the edge as before. */
+bool SdlContext::deferTouchRelease(const SDL_TouchFingerEvent& raw,
+                                   const SDL_TouchFingerEvent& remote)
+{
+	if (!vmonitorsActive() || (_windows.size() < 2))
+		return false;
+
+	constexpr float edge = 0.0005f;
+	const bool atEdge = (raw.x <= edge) || (raw.x >= 1.0f - edge) || (raw.y <= edge) ||
+	                    (raw.y >= 1.0f - edge);
+	if (!atEdge)
+		return false;
+
+	_pendingTouchRelease = remote;
+	_pendingTouchReleaseActive = true;
+	_dbgLogMotionUntil = SDL_GetTicks() + 400; /* [debug-script] temporary */
+	_dbgSnapAt = SDL_GetTicks() + 1000;
+	WLog_Print(getWLog(), WLOG_DEBUG,
+	           "deferred touch release: held at window %u edge raw=%.4f,%.4f remote=%.0f,%.0f",
+	           raw.windowID, static_cast<double>(raw.x), static_cast<double>(raw.y),
+	           static_cast<double>(remote.x), static_cast<double>(remote.y));
+	const int generation = ++_pendingTouchReleaseGeneration;
+	SDL_AddTimer(
+	    300,
+	    [](void* userdata, SDL_TimerID, Uint32) -> Uint32
+	    {
+		    std::ignore = sdl_push_user_event(
+		        SDL_EVENT_USER_TOUCH_RELEASE,
+		        static_cast<int>(reinterpret_cast<intptr_t>(userdata)));
+		    return 0;
+	    },
+	    reinterpret_cast<void*>(static_cast<intptr_t>(generation)));
+	return true;
+}
+
+bool SdlContext::flushPendingTouchRelease(int generation)
+{
+	if (!_pendingTouchReleaseActive)
+		return true;
+	if ((generation >= 0) && (generation != _pendingTouchReleaseGeneration))
+		return true; /* timer for an earlier, already flushed release */
+	_pendingTouchReleaseActive = false;
+	WLog_Print(getWLog(), WLOG_DEBUG, "deferred touch release: releasing at window %u (%.0f,%.0f)%s",
+	           _pendingTouchRelease.windowID, static_cast<double>(_pendingTouchRelease.x),
+	           static_cast<double>(_pendingTouchRelease.y), (generation >= 0) ? " (timeout)" : "");
+	return SdlTouch::handleEvent(this, _pendingTouchRelease);
+}
+
+bool SdlContext::resolvePendingTouchRelease(SDL_WindowID windowID, const SDL_FPoint& local,
+                                            float x, float y)
+{
+	/* While a release is pending, motion is never forwarded: the button is still down on the
+	 * server, and what gamescope reports in the meantime is not where the pointer is.
+	 * - Motion from the touch's own window is still pinned to its edge, or a stray position
+	 *   (seen: x=1130 for a pointer already over the next panel).
+	 * - The first motion on the new window is often on that window's border (seen: x=3839,
+	 *   the far edge of panel 2, at the pinned height), with the real position right after.
+	 * Releasing at either drops the dragged window in the wrong place, or at a monitor edge,
+	 * where Windows snaps it. Release at the first position inside another window instead;
+	 * the timer releases at the pinned edge if none comes. */
+	if (windowID == _pendingTouchRelease.windowID)
+		return true;
+
+	auto window = getWindowForId(windowID);
+	if (!window)
+		return true;
+	const auto r = window->rect();
+	if ((local.x <= 0.0f) || (local.y <= 0.0f) || (local.x >= static_cast<float>(r.w - 1)) ||
+	    (local.y >= static_cast<float>(r.h - 1)))
+		return true;
+
+	WLog_Print(getWLog(), WLOG_DEBUG,
+	           "deferred touch release: moved from window %u (%.0f,%.0f) to window %u (%.0f,%.0f)",
+	           _pendingTouchRelease.windowID, static_cast<double>(_pendingTouchRelease.x),
+	           static_cast<double>(_pendingTouchRelease.y), windowID, static_cast<double>(x),
+	           static_cast<double>(y));
+	_pendingTouchRelease.windowID = windowID;
+	_pendingTouchRelease.x = x;
+	_pendingTouchRelease.y = y;
+	return flushPendingTouchRelease();
 }
 
 void SdlContext::addOrUpdateDisplay(SDL_DisplayID id)
@@ -2120,4 +2214,13 @@ bool SdlContext::toggleFullscreen(SDL_WindowID id)
 		return true;
 	const bool isFullscreen = (SDL_GetWindowFlags(window->window()) & SDL_WINDOW_FULLSCREEN) != 0;
 	return sdl_push_user_event(SDL_EVENT_USER_WINDOW_FULLSCREEN, window, !isFullscreen, true);
+}
+
+/* [debug-script] temporary */
+bool SdlContext::debugSaveSnapshot(const char* path)
+{
+	std::unique_lock lock(_critical);
+	if (!_primary)
+		return false;
+	return SDL_SaveBMP(_primary.get(), path);
 }

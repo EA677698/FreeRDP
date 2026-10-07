@@ -205,6 +205,10 @@ investigated to a root cause — neither is a bug in this fork's code:
 
 ### Input lag / backlog with 3 windows
 
+> **Superseded 2026-10-06:** the conclusion below ("upstream of this
+> process, in gamescope") was wrong. The lag was client-side and is fixed.
+> See "Input lag: real root cause and fix" at the end of this file.
+
 Severe (multi-second) input lag was observed in the first live 3-window
 test, with a 300+ event backlog dumping at once on window close. Traced
 with two tools: (1) per-event TRACE logging already in `sdl_run()`
@@ -430,3 +434,62 @@ the exact same code already produced both outcomes, a revert isn't
 expected to reliably help, and current HEAD also has the damage-culling
 and coalescing fixes (real improvements, even though neither fixed the
 main lag) that a revert would throw away for no proven benefit.
+
+## Input lag: real root cause and fix (2026-10-06)
+
+The earlier conclusion ("delay is upstream, in gamescope") rested on one
+wrong assumption: that `event.common.timestamp` is when the compositor
+generated the event. On X11 it isn't. SDL3's `X11_GetEventTimestamp()`
+(`deps/sdl3-src/src/video/x11/SDL_x11events.c`) is a FIXME stub that
+returns `SDL_GetTicksNS()`, i.e. when SDL read the event off the X
+socket. So "staleness" measured only time spent queued *inside this
+process*, and a growing staleness meant our main loop was dequeuing
+slower than events arrived.
+
+**Evidence that was already in the old logs.** Re-analyzing
+`logs/timing_debug.log` by time-to-next-dequeue per event type (127s
+session): MOUSE_MOTION 6491 events / 40.6s, WINDOW_MOUSE_LEAVE 3005 /
+38.3s, WINDOW_MOUSE_ENTER 3006 / 32.6s, but USER_UPDATE (all rendering)
+1007 / 1.6s. The main thread spent ~111 of 127s on pointer events.
+`vmonitors_trace.log` shows the same pattern. The one "good" run
+(`freerdp_staleness.log`) had ~30 enter/leave pairs instead of ~3000.
+
+**Causes (both on the main thread, per event):**
+
+1. `sdlDispContext::handleEvent(const SDL_WindowEvent&)` calls
+   `window->setBordered()` on *every* window event. `SdlWindow::setBordered`
+   then called `SDL_SyncWindow()` unconditionally. On X11 that is
+   `X11_SyncWindowTimeout`: at least 2-3 `XSync` round trips plus an event
+   pump, ~10.5ms per call under gamescope's Xwayland. Every enter/leave
+   paid it.
+2. `sdlInput::mouse_focus()` raised the window (`SDL_RaiseWindow` +
+   `SDL_SyncWindow`) every time motion came from a different window than
+   the last one. Under gamescope this keeps the pointer flapping between
+   panels: measured ~34 enter/leave pairs/s **with no input at all**,
+   which on its own saturated the loop.
+
+**Fix:** `setBordered` returns early when the border state already
+matches (no sync), and `mouse_focus` doesn't raise under `/vmonitors`,
+where each window is an independent VR panel. Also removed the per-draw
+`[timing-debug]` INFO log from `drawToWindow`. It had answered its question
+and wrote a log line per draw.
+
+**Measurement.** New `[loop-stats]` diagnostic in `sdl_run`
+(`sdl_freerdp.cpp`): set `SDL_FREERDP_LOOP_STATS=1` and every 5s it logs
+handler time per event type, total busy vs. wait/pump time, and max
+staleness. The load generator, `tools/xdrive-pointer.py` in the framescape repo, is an XTest script on `DISPLAY=:0` that
+restacks the three client windows under the pointer and injects motion
+(~25 crossings/s and ~50 motions/s, like the old captures), 60s,
+`/vmonitors:1920x1080,1920x1080,1920x1080` against the test desktop:
+
+| | before | after |
+|---|---|---|
+| main thread busy | 98-100% | ~7% |
+| max staleness | 0.5s, climbing to 29s | 6-21ms, flat |
+| motion handler | 6-13ms | 0.08ms |
+| enter / leave | ~11ms / ~11ms | 0.4ms / 1.6ms |
+
+Logs: `logs/fix_baseline.log`, `logs/fix_after.log`. The XTest
+simulation isn't the real VR input path, so still to do: confirm with
+Erick on the controllers. Gamescope #437/#1709 may still be real, but
+they weren't what this was.

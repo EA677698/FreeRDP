@@ -18,6 +18,8 @@
  */
 
 #include <iostream>
+#include <algorithm>
+#include <map>
 #include <memory>
 #include <mutex>
 
@@ -158,18 +160,210 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 	std::ignore = sdl_push_quit();
 }
 
+/* [loop-stats] diagnostic: every 5s, logs main-loop handler cost per event type and the
+ * worst queue staleness. Off unless SDL_FREERDP_LOOP_STATS is set. This is how the
+ * multi-window input lag was measured (see NOTES.md). */
+namespace
+{
+	class LoopStats
+	{
+	  public:
+		explicit LoopStats(wLog* log)
+		    : _log(log), _enabled(SDL_getenv("SDL_FREERDP_LOOP_STATS") != nullptr),
+		      _start(SDL_GetTicksNS()), _lastReport(_start)
+		{
+		}
+
+		void add(Uint32 type, Uint64 ns, Sint64 staleMs)
+		{
+			if (!_enabled)
+				return;
+			auto& e = _byType[type];
+			e.count++;
+			e.totalNs += ns;
+			e.maxNs = std::max(e.maxNs, ns);
+			if ((type != SDL_EVENT_MOUSE_WHEEL) && (staleMs >= 0) && (staleMs < 1000000))
+				_maxStaleMs = std::max(_maxStaleMs, staleMs);
+		}
+
+		/* Round trip for a discrete input (key, button, finger down): time until the next
+		 * screen update is posted by the RDP thread (network + server + decode), and until
+		 * that update has been drawn and presented. User events are stamped when pushed. */
+		/* Damaged area of the update just drawn: caret blinks and other small updates
+		 * shouldn't count as the response to an input. */
+		void setUpdateArea(const std::vector<SDL_Rect>& rects)
+		{
+			_updateArea = 0;
+			for (const auto& r : rects)
+				_updateArea = std::max<Sint64>(_updateArea, static_cast<Sint64>(r.w) * r.h);
+		}
+
+		void trackLatency(const SDL_Event& ev, Uint64 handledNs)
+		{
+			if (!_enabled)
+				return;
+			switch (ev.type)
+			{
+				case SDL_EVENT_KEY_DOWN:
+				case SDL_EVENT_MOUSE_BUTTON_DOWN:
+				case SDL_EVENT_FINGER_DOWN:
+					if (_pendingInputNs == 0)
+						_pendingInputNs = ev.common.timestamp;
+					break;
+				case SDL_EVENT_USER_UPDATE:
+					if ((_pendingInputNs != 0) && (ev.common.timestamp > _pendingInputNs) &&
+					    (_updateArea >= 200 * 200))
+					{
+						WLog_Print(_log, WLOG_INFO,
+						           "[latency] input->update=%.1fms input->presented=%.1fms",
+						           (ev.common.timestamp - _pendingInputNs) / 1e6,
+						           (handledNs - _pendingInputNs) / 1e6);
+						_pendingInputNs = 0;
+					}
+					break;
+				default:
+					break;
+			}
+		}
+
+		void addWait(Uint64 ns)
+		{
+			if (_enabled)
+				_waitNs += ns;
+		}
+
+		void maybeReport()
+		{
+			if (!_enabled)
+				return;
+			const auto now = SDL_GetTicksNS();
+			if (now - _lastReport < SDL_NS_PER_SECOND * 5)
+				return;
+			Uint64 busy = 0;
+			for (const auto& [type, e] : _byType)
+			{
+				busy += e.totalNs;
+				WLog_Print(_log, WLOG_INFO,
+				           "[loop-stats] %-36s n=%6" PRIu64 " total=%7.1fms avg=%6.2fms max=%6.1fms",
+				           sdl::utils::toString(type).c_str(), e.count, e.totalNs / 1e6,
+				           e.totalNs / 1e6 / static_cast<double>(e.count), e.maxNs / 1e6);
+			}
+			WLog_Print(_log, WLOG_INFO,
+			           "[loop-stats] window=%.1fs busy=%.1fms wait/pump=%.1fms max_staleness=%" PRId64
+			           "ms (t=%.0fs)",
+			           (now - _lastReport) / 1e9, busy / 1e6, _waitNs / 1e6, _maxStaleMs,
+			           (now - _start) / 1e9);
+			_byType.clear();
+			_waitNs = 0;
+			_maxStaleMs = 0;
+			_lastReport = now;
+		}
+
+	  private:
+		struct Entry
+		{
+			Uint64 count = 0;
+			Uint64 totalNs = 0;
+			Uint64 maxNs = 0;
+		};
+		wLog* _log;
+		bool _enabled;
+		Uint64 _start;
+		Uint64 _lastReport;
+		Uint64 _waitNs = 0;
+		Sint64 _maxStaleMs = 0;
+		Uint64 _pendingInputNs = 0;
+		Sint64 _updateArea = 0;
+		std::map<Uint32, Entry> _byType;
+	};
+} // namespace
+
+/* [debug-script] temporary: if $SDL_FREERDP_DEBUG_SCRIPT names a file that exists, run its
+ * lines ("down X Y", "move X Y", "up X Y", "sleep MS", "snap PATH") as raw RDP left-button
+ * input in remote desktop coordinates, then delete it. */
+static void sdl_run_debug_script(SdlContext* sdl)
+{
+	static const char* path = SDL_getenv("SDL_FREERDP_DEBUG_SCRIPT");
+	if (!path)
+		return;
+	if ((sdl->_dbgSnapAt != 0) && (SDL_GetTicks() >= sdl->_dbgSnapAt))
+	{
+		sdl->_dbgSnapAt = 0;
+		const auto snap = std::string(path) + ".release" + std::to_string(++sdl->_dbgSnapCount) + ".bmp";
+		WLog_Print(sdl->getWLog(), WLOG_INFO, "[drag-debug] snapshot %s -> %d", snap.c_str(),
+		           sdl->debugSaveSnapshot(snap.c_str()));
+	}
+	FILE* fp = fopen(path, "r");
+	if (!fp)
+		return;
+	char line[512] = {};
+	while (fgets(line, sizeof(line), fp))
+	{
+		char cmd[32] = {};
+		char arg[400] = {};
+		int x = 0;
+		int y = 0;
+		if (sscanf(line, "%31s", cmd) != 1)
+			continue;
+		BOOL rc = TRUE;
+		if ((strcmp(cmd, "down") == 0) && (sscanf(line, "%*s %d %d", &x, &y) == 2))
+		{
+			rc = freerdp_client_send_button_event(sdl->common(), FALSE, PTR_FLAGS_MOVE, x, y) &&
+			     freerdp_client_send_button_event(sdl->common(), FALSE,
+			                                      PTR_FLAGS_DOWN | PTR_FLAGS_BUTTON1, x, y);
+		}
+		else if ((strcmp(cmd, "move") == 0) && (sscanf(line, "%*s %d %d", &x, &y) == 2))
+			rc = freerdp_client_send_button_event(sdl->common(), FALSE, PTR_FLAGS_MOVE, x, y);
+		else if ((strcmp(cmd, "up") == 0) && (sscanf(line, "%*s %d %d", &x, &y) == 2))
+		{
+			rc = freerdp_client_send_button_event(sdl->common(), FALSE, PTR_FLAGS_MOVE, x, y) &&
+			     freerdp_client_send_button_event(sdl->common(), FALSE, PTR_FLAGS_BUTTON1, x, y);
+		}
+		else if ((strcmp(cmd, "sleep") == 0) && (sscanf(line, "%*s %d", &x) == 1))
+			SDL_Delay(static_cast<Uint32>(x));
+		else if ((strcmp(cmd, "snap") == 0) && (sscanf(line, "%*s %399s", arg) == 1))
+			rc = sdl->debugSaveSnapshot(arg);
+		WLog_Print(sdl->getWLog(), WLOG_INFO, "[debug-script] %s -> %d", cmd, rc);
+	}
+	fclose(fp);
+	std::ignore = remove(path);
+}
+
 [[nodiscard]] static int sdl_run(SdlContext* sdl)
 {
 	int rc = -1;
 	WINPR_ASSERT(sdl);
+	LoopStats stats(sdl->getWLog());
 
 	try
 	{
 		while (!sdl->shallAbort())
 		{
+			sdl_run_debug_script(sdl);
 			SDL_Event windowEvent = {};
+			Uint64 waitStart = SDL_GetTicksNS();
 			while (!sdl->shallAbort() && SDL_WaitEventTimeout(nullptr, 1000))
 			{
+				sdl_run_debug_script(sdl);
+				const Uint64 handleStart = SDL_GetTicksNS();
+				stats.addWait(handleStart - waitStart);
+				struct StatsGuard
+				{
+					LoopStats& s;
+					const SDL_Event& ev;
+					Uint64 begin;
+					Uint64& waitStart;
+					~StatsGuard()
+					{
+						waitStart = SDL_GetTicksNS();
+						const Sint64 stale = static_cast<Sint64>(SDL_GetTicks()) -
+						                     static_cast<Sint64>(ev.common.timestamp / 1000000ULL);
+						s.add(ev.type, waitStart - begin, stale);
+						s.trackLatency(ev, waitStart);
+						s.maybeReport();
+					}
+				} statsGuard{ stats, windowEvent, handleStart, waitStart };
+
 				/* Only poll standard SDL events and SDL_EVENT_USERS meant to create
 				 * dialogs. do not process the dialog return value events here.
 				 */
@@ -267,6 +461,7 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 								break;
 							merged.insert(merged.end(), rectangles.begin(), rectangles.end());
 						}
+						stats.setUpdateArea(merged);
 						if (!sdl->drawToWindows(merged))
 							throw ErrorMsg{ -1, windowEvent.type, "sdl->drawToWindows" };
 					}
@@ -330,6 +525,10 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 						sdl->getRailChannelContext().handleLocalMoveRequested(id, moveType);
 					}
 					break;
+					case SDL_EVENT_USER_TOUCH_RELEASE:
+						if (!sdl->flushPendingTouchRelease(windowEvent.user.code))
+							throw ErrorMsg{ -1, windowEvent.type, "sdl->flushPendingTouchRelease" };
+						break;
 					case SDL_EVENT_USER_QUIT:
 					default:
 						break;

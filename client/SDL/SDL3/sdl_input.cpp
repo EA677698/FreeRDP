@@ -659,7 +659,14 @@ bool sdlInput::mouse_focus(Uint32 windowID)
 		_lastWindowID = windowID;
 		auto window = _sdl->getWindowForId(windowID);
 		if (window)
-			window->raise();
+		{
+			/* /vmonitors windows are independent panels (one VR panel each under
+			 * gamescope): raising the one under the pointer gains nothing, and under
+			 * gamescope each raise shifts focus and produces more enter/leave/motion
+			 * traffic, a self-sustaining loop that saturated the event loop. */
+			if (!_sdl->vmonitorsActive())
+				window->raise();
+		}
 		else
 			return _sdl->getRailChannelContext().ownsWindow(windowID);
 	}
